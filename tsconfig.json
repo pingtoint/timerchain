@@ -1,0 +1,23 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    // 规格要求：TypeScript 严格模式，禁止 any
+    "strict": true,
+    "paths": {
+      // ── 为什么需要这条映射 ──────────────────────────────────────────
+      // @alimirzayev/react-native-background-timer 的 package.json 里
+      // "react-native" 指向未编译的 src/*.ts。tsconfig.base 的 customConditions
+      // 含 "react-native"，于是 tsc 会去解析它的 TS 源码，而那段源码在 strict
+      // 下有一处自身类型不严谨（Spec | undefined 传给 NativeTimerModule | null），
+      // 导致**我们自己的** typecheck 失败。
+      //
+      // 该问题只存在于类型层面（运行时有 != null 守卫），作者发布的
+      // lib/typescript/*.d.ts 里没有。把 tsc 固定到已发布的声明文件，
+      // 等价于 skipLibCheck 对第三方库的预期行为，且不影响 Metro 打包
+      //（Metro 走 react-native 字段，不读 tsconfig paths）。
+      "@alimirzayev/react-native-background-timer": [
+        "./node_modules/@alimirzayev/react-native-background-timer/lib/typescript/index.d.ts"
+      ]
+    }
+  }
+}
