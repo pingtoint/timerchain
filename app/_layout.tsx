@@ -18,6 +18,7 @@ import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-cont
 
 import { Banner } from '../components';
 import { configureAudioSession, useRunAlerts } from '../hooks/useAlert';
+import * as notificationService from '../notifications/notificationService';
 import { usePlanStore } from '../store/planStore';
 import { layout, spacing } from '../theme';
 
@@ -27,6 +28,9 @@ export default function RootLayout() {
     // 冷启动即归零：上次被杀时残留的 run 状态没有任何意义（也不做恢复，
     // 因为"恢复到哪一步"需要落库 + 处理被跳过的阶段，复杂度远大于收益）。
     usePlanStore.getState().clearRun();
+    // 通知服务：注册 handler + 点击监听 + 请求权限，并按 DB 重排全部提醒
+    // （覆盖"App 长期未打开 / 系统回收了 pending 通知"的场景）。
+    void notificationService.refreshAll();
   }, []);
 
   useRunAlerts();

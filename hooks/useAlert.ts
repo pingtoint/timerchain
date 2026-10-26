@@ -105,6 +105,7 @@ export function playAlertHaptics(kind: RunAlertKind): void {
       case 'step':
         return Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
       case 'rest':
+      case 'repeatRest':
         return Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
       case 'finished':
         // 规格 B：全部完成时给一个明确的成功触感

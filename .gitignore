@@ -39,3 +39,12 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# IDE
+.idea/
+.pai/
+miniprogram/.pai/
+
+# build artifacts (distributed separately, exceed Gitee file limits)
+*.apk
+timerchain-source.zip

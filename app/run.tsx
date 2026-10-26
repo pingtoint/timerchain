@@ -4,22 +4,22 @@
  * ── 页面只做三件事 ─────────────────────────────────────────────────
  * 1. 把 store 里的 `run` 渲染出来（倒计时、当前步骤、进度）；
  * 2. 提供 暂停/继续、终止 两个动作；
- * 3. 在执行被中断时**先征求确认**（规格 E）。
+ * 3. 运行时离开页面**不终止任务** —— FGS 前台服务通知接管控制，
+ *    用户可以在通知栏点暂停/终止，或回到 App 继续看。
  *
- * 它自己**不含任何计时逻辑**：心跳由 `useTimer()` 挂载，剩余时间由 store 基于
- * 结束时间戳现算。这样即使这个页面被重渲染、甚至被卸载再挂载，倒计时也不会
- * 因此变慢或跳变 —— 时间只有一个权威来源。
+ * ── 为什么不拦截返回 ──────────────────────────────────────────────
+ * 之前用 usePreventRemove 拦住所有离开路径（返回键、侧滑、头部按钮），
+ * 导致用户跑着任务时根本走不出执行页 —— 这完全违背了 FGS 的设计初衷。
+ * 美团外卖、Keep 的做法：执行/配送中，用户可以自由切出 App，
+ * 通知栏的常驻卡片继续显示进度并提供控制入口。
  *
- * ── 中断确认为什么用 usePreventRemove ────────────────────────────
- * 离开执行页有四条路径：头部返回按钮、Android 物理返回键、iOS 侧滑手势、
- * 以及程序化跳转。前两条可以自己拦截，侧滑手势却不行 —— 而"只是想在页面上
- * 横向划一下，结果把正在跑的任务划掉了"是最让人火大的一种体验。
- * `usePreventRemove` 统一拦住这四条，确认后再放行，行为完全一致。
+ * 终止任务的唯一入口：执行页的"终止"按钮 + 通知栏的"终止"按钮。
+ * 这两个入口才需要二次确认（规格 E），导航离开不需要。
  */
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
-import { usePreventRemove, useRouter } from 'expo-router';
+import { useRouter } from 'expo-router';
 import Animated, { FadeIn, FadeOut } from 'react-native-reanimated';
 
 import {
@@ -46,63 +46,48 @@ export default function RunScreen() {
   const pauseRun = usePlanStore((state) => state.pauseRun);
   const resumeRun = usePlanStore((state) => state.resumeRun);
   const stopRun = usePlanStore((state) => state.stopRun);
+  const completeRep = usePlanStore((state) => state.completeRep);
 
   const [confirmVisible, setConfirmVisible] = useState(false);
-  /** 被拦截的导航动作的"重放"函数（由 usePreventRemove 提供）。 */
-  const repeatRef = useRef<(() => void) | null>(null);
 
   const isRunning = run.status === 'running';
   const isPaused = run.status === 'paused';
   const isFinished = run.status === 'finished';
-  const isActive = isRunning || isPaused;
 
-  const disablePrevention = usePreventRemove(isActive, ({ repeat }) => {
-    // 括号里不直接弹窗：这里拿到的 repeat 需要等用户在弹窗里点了"终止"才用，
-    // 所以先存下来，由 confirmLeave 决定重放还是干脆自己导航。
-    repeatRef.current = repeat;
-    setConfirmVisible(true);
-  });
-
-  /** 真正离开页面。先停表，再放行导航。 */
-  const exitNow = useCallback(() => {
-    stopRun();
-
-    const repeat = repeatRef.current;
-    repeatRef.current = null;
-    if (repeat !== null) {
-      // 来自侧滑/物理返回键：重放原动作，去哪个页面由原动作决定
-      repeat();
-      return;
-    }
-
-    // 来自头部按钮或"终止"按钮：自己导航。
-    // 必须先 disablePrevention()，否则这次 back() 会被自己的拦截规则挡回去。
-    disablePrevention();
+  /** 头部返回 / Android 返回键 / iOS 侧滑 —— 不终止任务，FGS 接管。 */
+  const handleBack = useCallback(() => {
     if (router.canGoBack()) {
       router.back();
     } else {
       router.replace('/');
     }
-  }, [disablePrevention, router, stopRun]);
+  }, [router]);
 
-  const requestLeave = useCallback(() => {
-    // 只有"还在跑"的时候才需要确认；已完成或未开始，直接走。
-    if (isActive) {
-      setConfirmVisible(true);
+  /** 显式终止任务（执行页"终止"按钮）—— 需要二次确认。 */
+  const requestStop = useCallback(() => {
+    if (isFinished) {
+      stopRun();
+      handleBack();
       return;
     }
-    exitNow();
-  }, [exitNow, isActive]);
+    setConfirmVisible(true);
+  }, [isFinished, stopRun, handleBack]);
+
+  const confirmStop = useCallback(() => {
+    setConfirmVisible(false);
+    stopRun();
+    handleBack();
+  }, [stopRun, handleBack]);
 
   if (plan === null) {
     return (
       <Screen variant="plain">
-        <Header title="执行" onBack={exitNow} />
+        <Header title="执行" onBack={handleBack} />
         <EmptyState
           icon="timer-outline"
           title="没有正在执行的任务"
           description="回到列表，选择一条任务链开始专注"
-          action={<Button label="返回列表" fullWidth onPress={exitNow} />}
+          action={<Button label="返回列表" fullWidth onPress={handleBack} />}
         />
       </Screen>
     );
@@ -111,19 +96,27 @@ export default function RunScreen() {
   const total = plan.steps.length;
   const currentStep = plan.steps[run.currentIndex];
   const nextStep = plan.steps[run.currentIndex + 1];
-  const isRest = run.phase === 'rest' && !isFinished;
+  const isGap = run.phase === 'repeatRest' && !isFinished;
+  const isRest = (run.phase === 'rest' || run.phase === 'repeatRest') && !isFinished;
+  const repeatTotal = currentStep?.repeatCount ?? 1;
+  /** 计次步骤的计次阶段：表在正数走，推进靠"完成本遍"。 */
+  const isCountRep = !isFinished && !isRest && currentStep?.kind === 'count';
 
   const headerTitle = isFinished
     ? '全部完成'
-    : isRest
-      ? '休息中'
-      : formatStepCounter(run.currentIndex + 1, total);
+    : isGap
+      ? '间隙中'
+      : isRest
+        ? '休息中'
+        : formatStepCounter(run.currentIndex + 1, total);
 
-  const bodyText = resolveBodyText(isFinished, isRest, currentStep?.content, nextStep?.title);
+  const bodyText = isGap
+    ? `即将开始第 ${Math.min(run.repeatIndex + 2, repeatTotal)}/${repeatTotal} 遍`
+    : resolveBodyText(isFinished, isRest, currentStep?.content, nextStep?.title);
 
   return (
     <Screen variant="plain">
-      <Header title={headerTitle} subtitle={plan.title} onBack={requestLeave} />
+      <Header title={headerTitle} subtitle={plan.title} onBack={handleBack} />
 
       <StepIndicator
         total={total}
@@ -149,12 +142,19 @@ export default function RunScreen() {
             color={isFinished ? 'success' : isRest ? 'warning' : 'primary'}
             align="center"
           >
-            {isFinished ? '已完成' : isRest ? '休息中' : '当前步骤'}
+            {isFinished ? '已完成' : isGap ? '间隙中' : isRest ? '休息中' : '当前步骤'}
           </AppText>
 
           <AppText variant="h1" align="center" style={styles.title}>
             {isFinished ? '全部完成 🎉' : isRest ? '休息一下' : currentStep?.title ?? ''}
           </AppText>
+
+          {/* 多遍步骤：计时阶段显示"第 X/N 遍"，Tabata 场景的位置感全靠它 */}
+          {!isFinished && !isRest && repeatTotal > 1 ? (
+            <AppText variant="bodyStrong" color="primary" align="center">
+              第 {Math.min(run.repeatIndex + 1, repeatTotal)}/{repeatTotal} 遍
+            </AppText>
+          ) : null}
 
           {bodyText === null ? null : (
             <AppText variant="body" color="textSecondary" align="center" style={styles.body}>
@@ -176,7 +176,13 @@ export default function RunScreen() {
             </AppText>
 
             <AppText variant="caption" color="textSecondary" align="center">
-              {isPaused ? '已暂停' : isRest ? '休息倒计时' : '本步剩余时间'}
+              {isPaused
+                ? '已暂停'
+                : isRest
+                  ? '休息倒计时'
+                  : isCountRep
+                    ? '已进行'
+                    : '本步剩余时间'}
             </AppText>
           </>
         )}
@@ -184,26 +190,43 @@ export default function RunScreen() {
 
       <View style={styles.footer}>
         {isFinished ? (
-          <Button label="返回列表" size="lg" fullWidth onPress={exitNow} />
+          <Button label="返回列表" size="lg" fullWidth onPress={handleBack} />
         ) : (
-          <View style={styles.actions}>
-            <Button
-              label={isRunning ? '暂停' : '继续'}
-              icon={isRunning ? 'pause' : 'play'}
-              variant="secondary"
-              size="lg"
-              style={styles.actionButton}
-              onPress={isRunning ? pauseRun : resumeRun}
-            />
-            <Button
-              label="终止"
-              icon="stop"
-              variant="danger"
-              size="lg"
-              style={styles.actionButton}
-              onPress={requestLeave}
-            />
-          </View>
+          <>
+            {/* 计次阶段的主按钮：做完一遍手动推进。暂停时必须先继续，避免"暂停中完成"的歧义状态 */}
+            {isCountRep && isRunning ? (
+              <Button
+                label={
+                  run.repeatIndex < repeatTotal - 1
+                    ? `完成第 ${run.repeatIndex + 1} 遍`
+                    : '完成本步'
+                }
+                icon="checkmark"
+                size="lg"
+                fullWidth
+                onPress={completeRep}
+                style={styles.completeButton}
+              />
+            ) : null}
+            <View style={styles.actions}>
+              <Button
+                label={isRunning ? '暂停' : '继续'}
+                icon={isRunning ? 'pause' : 'play'}
+                variant="secondary"
+                size="lg"
+                style={styles.actionButton}
+                onPress={isRunning ? pauseRun : resumeRun}
+              />
+              <Button
+                label="终止"
+                icon="stop"
+                variant="danger"
+                size="lg"
+                style={styles.actionButton}
+                onPress={requestStop}
+              />
+            </View>
+          </>
         )}
       </View>
 
@@ -214,11 +237,8 @@ export default function RunScreen() {
         confirmLabel="终止"
         cancelLabel="继续执行"
         tone="danger"
-        onCancel={() => {
-          repeatRef.current = null;
-          setConfirmVisible(false);
-        }}
-        onConfirm={exitNow}
+        onCancel={() => setConfirmVisible(false)}
+        onConfirm={confirmStop}
       />
     </Screen>
   );
@@ -275,6 +295,9 @@ const styles = StyleSheet.create({
   },
   footer: {
     paddingTop: spacing.md,
+  },
+  completeButton: {
+    marginBottom: spacing.md,
   },
   actions: {
     flexDirection: 'row',

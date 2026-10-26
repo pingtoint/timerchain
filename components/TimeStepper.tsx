@@ -15,9 +15,10 @@
  * 吸附到最近的梯子档位，而不是先归零再走 —— 这样不会出现"点一下变成 0"。
  */
 
-import { StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
+import { useState } from 'react';
+import { Pressable, StyleSheet, TextInput, View, type StyleProp, type ViewStyle } from 'react-native';
 
-import { colors, spacing } from '../theme';
+import { colors, radius, spacing } from '../theme';
 import { formatLength } from '../utils/format';
 import { AppText } from './AppText';
 import { IconButton } from './IconButton';
@@ -60,6 +61,33 @@ export function TimeStepper({
   const canDecrease = !disabled && lower !== null;
   const canIncrease = !disabled && upper !== null;
 
+  /**
+   * 手输模式：点数值展开"分 / 秒"两个输入框。
+   * ± 档位再密也覆盖不了 137 秒这类精确值 —— 梯子管"快"，手输管"准"。
+   */
+  const [manual, setManual] = useState(false);
+  const [minText, setMinText] = useState('');
+  const [secText, setSecText] = useState('');
+
+  const maxValue = rungs.length > 0 ? rungs[rungs.length - 1]! : Number.MAX_SAFE_INTEGER;
+
+  const openManual = () => {
+    if (disabled) {
+      return;
+    }
+    setMinText(String(Math.floor(value / 60)));
+    setSecText(String(value % 60));
+    setManual(true);
+  };
+
+  const confirmManual = () => {
+    const min = Number.parseInt(minText, 10);
+    const sec = Number.parseInt(secText, 10);
+    const total = (Number.isNaN(min) ? 0 : min) * 60 + (Number.isNaN(sec) ? 0 : sec);
+    onChange(Math.max(0, Math.min(total, maxValue)));
+    setManual(false);
+  };
+
   return (
     <View style={[styles.container, style]}>
       <View style={styles.row}>
@@ -82,11 +110,17 @@ export function TimeStepper({
             disabled={!canDecrease}
           />
 
-          <View style={styles.valueBox}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`手动输入${label}`}
+            onPress={openManual}
+            disabled={disabled}
+            style={styles.valueBox}
+          >
             <AppText variant="bodyStrong" tabular align="center" color={disabled ? 'textDisabled' : 'text'}>
               {value === 0 && zeroLabel !== undefined ? zeroLabel : formatLength(value)}
             </AppText>
-          </View>
+          </Pressable>
 
           <IconButton
             name="add"
@@ -103,6 +137,52 @@ export function TimeStepper({
           />
         </View>
       </View>
+
+      {manual ? (
+        <View style={styles.manualRow}>
+          <TextInput
+            value={minText}
+            onChangeText={setMinText}
+            keyboardType="number-pad"
+            selectTextOnFocus
+            autoFocus
+            accessibilityLabel={`${label}分钟`}
+            style={styles.manualInput}
+            maxLength={3}
+          />
+          <AppText variant="caption" color="textSecondary">
+            分
+          </AppText>
+          <TextInput
+            value={secText}
+            onChangeText={setSecText}
+            keyboardType="number-pad"
+            selectTextOnFocus
+            accessibilityLabel={`${label}秒`}
+            style={styles.manualInput}
+            maxLength={3}
+          />
+          <AppText variant="caption" color="textSecondary">
+            秒
+          </AppText>
+          <IconButton
+            name="checkmark"
+            accessibilityLabel="确认"
+            onPress={confirmManual}
+            variant="soft"
+            size={32}
+            iconSize={18}
+          />
+          <IconButton
+            name="close"
+            accessibilityLabel="取消"
+            onPress={() => setManual(false)}
+            variant="plain"
+            size={32}
+            iconSize={18}
+          />
+        </View>
+      ) : null}
 
       {hint === undefined ? null : (
         <AppText variant="caption" color="textSecondary" style={styles.hint}>
@@ -151,6 +231,26 @@ const styles = StyleSheet.create({
   },
   valueBox: {
     minWidth: 76,
+    paddingVertical: spacing.xs,
+  },
+  manualRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: spacing.sm,
+    marginTop: spacing.sm,
+  },
+  manualInput: {
+    width: 64,
+    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    borderRadius: radius.sm,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    backgroundColor: colors.bg,
+    color: colors.text,
+    textAlign: 'center',
+    fontSize: 16,
   },
   hint: {
     marginTop: spacing.xs,

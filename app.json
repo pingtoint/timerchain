@@ -14,7 +14,8 @@
         "UIBackgroundModes": [
           "audio",
           "audio"
-        ]
+        ],
+        "NSUserNotificationsUsageDescription": "TimerChain 需要通知权限来提醒你设定的任务开始时间。"
       }
     },
     "android": {
@@ -30,15 +31,13 @@
         "android.permission.VIBRATE",
         "android.permission.WAKE_LOCK",
         "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS",
         "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
-        "android.permission.VIBRATE",
-        "android.permission.WAKE_LOCK",
-        "android.permission.FOREGROUND_SERVICE",
-        "android.permission.RECORD_AUDIO",
-        "android.permission.MODIFY_AUDIO_SETTINGS",
-        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.SCHEDULE_EXACT_ALARM",
+        "android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"
       ]
     },
     "web": {
@@ -58,7 +57,14 @@
           "resizeMode": "contain",
           "backgroundColor": "#FFFFFF"
         }
-      ]
+      ],
+      "expo-secure-store",
+      "expo-sharing",
+      "expo-speech-recognition",
+      "expo-notifications",
+      "@react-native-community/datetimepicker",
+      "./plugins/withAiAppQueries",
+      "./plugins/withNotifeeForegroundService"
     ],
     "experiments": {
       "typedRoutes": false

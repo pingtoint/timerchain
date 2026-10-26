@@ -33,6 +33,7 @@ interface KindMeta {
 const KIND_META: Record<RunAlertKind, KindMeta> = {
   step: { icon: 'play', tone: 'primary', kicker: '当前步骤' },
   rest: { icon: 'cafe-outline', tone: 'warning', kicker: '休息中' },
+  repeatRest: { icon: 'cafe-outline', tone: 'warning', kicker: '间隙中' },
   finished: { icon: 'checkmark', tone: 'success', kicker: '全部完成' },
 };
 

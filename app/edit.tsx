@@ -26,6 +26,8 @@ import {
   Button,
   Dialog,
   Header,
+  IconButton,
+  ReminderRow,
   Screen,
   StateView,
   StepCard,
@@ -35,7 +37,8 @@ import { getPlanById } from '../db';
 import { useAlertSoundPreview } from '../hooks/useAlert';
 import { usePlanStore } from '../store/planStore';
 import { spacing } from '../theme';
-import type { SavePlanInput, Step } from '../types';
+import type { ReminderConfig, SavePlanInput, Step } from '../types';
+import { createId } from '../utils/id';
 import { formatApproxDuration, toErrorMessage } from '../utils/format';
 import {
   createEmptyStep,
@@ -46,20 +49,53 @@ import {
 } from '../utils/plan';
 
 function createNewDraft(): SavePlanInput {
-  return { id: null, title: '', steps: [createEmptyStep(0)] };
+  return { id: null, title: '', steps: [createEmptyStep(0)], reminder: null };
 }
 
 const serialize = (draft: SavePlanInput): string => JSON.stringify(draft);
 
+/**
+ * 解析路由传入的草稿（合并任务的入口）。
+ * 形状不对时静默回退到空白草稿 —— 参数可能被手工构造，不能信任。
+ */
+function parseDraftParam(raw: string | undefined): SavePlanInput | null {
+  if (typeof raw !== 'string' || raw.length === 0) {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (
+      typeof parsed === 'object' &&
+      parsed !== null &&
+      Array.isArray((parsed as SavePlanInput).steps) &&
+      (parsed as SavePlanInput).steps.length > 0 &&
+      typeof (parsed as SavePlanInput).title === 'string'
+    ) {
+      // 一律视为新建：合并产生的是一条新任务链，不覆盖任何已有数据
+      return {
+        id: null,
+        title: (parsed as SavePlanInput).title,
+        steps: (parsed as SavePlanInput).steps,
+        reminder: (parsed as SavePlanInput).reminder ?? null,
+      };
+    }
+  } catch {
+    // 落到下面的 null
+  }
+  return null;
+}
+
 export default function PlanEditorScreen() {
   const router = useRouter();
-  const params = useLocalSearchParams<{ id?: string }>();
+  const params = useLocalSearchParams<{ id?: string; draft?: string }>();
   const editingId = typeof params.id === 'string' && params.id.length > 0 ? params.id : null;
 
   const savePlan = usePlanStore((state) => state.savePlan);
   const previewSound = useAlertSoundPreview();
 
-  const [draft, setDraft] = useState<SavePlanInput>(createNewDraft);
+  const [draft, setDraft] = useState<SavePlanInput>(
+    () => parseDraftParam(params.draft) ?? createNewDraft(),
+  );
   /** 载入时的快照。用来判断"有没有未保存的修改"。 */
   const baselineRef = useRef<string>(serialize(draft));
 
@@ -72,7 +108,15 @@ export default function PlanEditorScreen() {
   const [exitVisible, setExitVisible] = useState(false);
   const repeatRef = useRef<(() => void) | null>(null);
 
-  const dirty = serialize(draft) !== baselineRef.current;
+  /**
+   * "是否有未保存改动"的双重判定：
+   * 1. 显式改动：序列化草稿 ≠ 载入快照
+   * 2. 隐式改动：带 draft 参数进来（合并任务 / AI 导入）—— 这条链还没真正落库，
+   *    就算用户啥都没改就返回，也应该拦截，否则辛辛苦苦合并出来的草稿丢了没处找。
+   */
+  const hasDraftParam =
+    typeof params.draft === 'string' && params.draft.length > 0 && parseDraftParam(params.draft) !== null;
+  const dirty = serialize(draft) !== baselineRef.current || (editingId === null && hasDraftParam);
 
   // ── 载入已有的任务链 ────────────────────────────────────────────
   useEffect(() => {
@@ -93,7 +137,12 @@ export default function PlanEditorScreen() {
           setLoadError('这条任务链已经不存在了，可能已被删除。');
           return;
         }
-        const loaded: SavePlanInput = { id: plan.id, title: plan.title, steps: plan.steps };
+        const loaded: SavePlanInput = {
+          id: plan.id,
+          title: plan.title,
+          steps: plan.steps,
+          reminder: plan.reminder,
+        };
         baselineRef.current = serialize(loaded);
         setDraft(loaded);
       } catch (error) {
@@ -175,6 +224,68 @@ export default function PlanEditorScreen() {
     }));
   }, []);
 
+  /** 复制一步，插在当前步之后。重新生成 id 避免撞 key。 */
+  const duplicateStep = useCallback((stepId: string) => {
+    setDraft((current) => {
+      const index = current.steps.findIndex((s) => s.id === stepId);
+      if (index === -1) {
+        return current;
+      }
+      const source = current.steps[index];
+      const copy: Step = {
+        ...source,
+        id: createId('step'),
+        order: source.order + 0.5, // 后面 normalize 会按下标重排
+      };
+      const next = [...current.steps];
+      next.splice(index + 1, 0, copy);
+      return {
+        ...current,
+        steps: next.map((s, i) => ({ ...s, order: i })),
+      };
+    });
+  }, []);
+
+  const updateReminder = useCallback((next: ReminderConfig | null) => {
+    setDraft((current) => ({ ...current, reminder: next }));
+  }, []);
+
+  /** 折叠状态：默认有描述的步骤展开，否则收起。 */
+  const [expandedMap, setExpandedMap] = useState<Record<string, boolean>>(() =>
+    parseDraftParam(params.draft)?.steps.reduce<Record<string, boolean>>(
+      (acc, s) => ({ ...acc, [s.id]: s.content.length > 0 }),
+      {},
+    ) ?? { _default: true },
+  );
+
+  // 载入已有任务链后，同步 expandedMap
+  useEffect(() => {
+    if (editingId === null) {
+      return;
+    }
+    // draft 变化后重新基于 steps 生成
+    setExpandedMap((prev) => {
+      const next: Record<string, boolean> = {};
+      for (const step of draft.steps) {
+        next[step.id] = prev[step.id] ?? step.content.length > 0;
+      }
+      return next;
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft.steps]);
+
+  const toggleStepExpanded = useCallback((stepId: string) => {
+    setExpandedMap((prev) => ({ ...prev, [stepId]: !(prev[stepId] ?? false) }));
+  }, []);
+
+  const setAllExpanded = useCallback(() => {
+    setExpandedMap(draft.steps.reduce<Record<string, boolean>>((acc, s) => ({ ...acc, [s.id]: true }), {}));
+  }, [draft.steps]);
+
+  const setAllCollapsed = useCallback(() => {
+    setExpandedMap(draft.steps.reduce<Record<string, boolean>>((acc, s) => ({ ...acc, [s.id]: false }), {}));
+  }, [draft.steps]);
+
   /** 拖拽结束后按下标重排 order。order 必须等于下标，否则落库顺序会错乱。 */
   const reorderSteps = useCallback((data: Step[]) => {
     setDraft((current) => ({
@@ -237,20 +348,36 @@ export default function PlanEditorScreen() {
             onDrag={drag}
             onChange={(patch) => updateStep(item.id, patch)}
             onRemove={() => removeStep(item.id)}
+            onDuplicate={() => duplicateStep(item.id)}
             onPreviewSound={previewSound}
+            expanded={expandedMap[item.id] ?? item.content.length > 0}
+            onToggleExpand={() => toggleStepExpanded(item.id)}
           />
         </View>
       );
     },
     [
+      duplicateStep,
+      expandedMap,
       previewSound,
       removeStep,
       showErrors,
       stepCount,
+      toggleStepExpanded,
       updateStep,
       validation.errors.stepFields,
     ],
   );
+
+  /** Header 右侧按钮文案：如果至少有一个步骤没展开，就显示"全部展开"，否则显示"全部收起"。 */
+  const allExpanded = useMemo(() => {
+    for (const step of draft.steps) {
+      if (!(expandedMap[step.id] ?? step.content.length > 0)) {
+        return false;
+      }
+    }
+    return true;
+  }, [draft.steps, expandedMap]);
 
   const listHeader = (
     <View style={styles.headerBlock}>
@@ -273,12 +400,25 @@ export default function PlanEditorScreen() {
           长按步骤左侧手柄可拖动排序
         </AppText>
       </View>
+
+      <ReminderRow value={draft.reminder ?? null} onChange={updateReminder} />
     </View>
   );
 
   return (
     <Screen variant="plain">
-      <Header title={editingId === null ? '新建任务' : '编辑任务'} onBack={requestExit} />
+      <Header
+        title={draft.title.trim().length > 0 ? draft.title : editingId === null ? '新建任务' : '编辑任务'}
+        subtitle={`${stepCount} 步 · 约 ${formatApproxDuration(totalDurationSec)}`}
+        onBack={requestExit}
+        right={
+          <IconButton
+            name={allExpanded ? 'contract-outline' : 'expand-outline'}
+            accessibilityLabel={allExpanded ? '全部收起' : '全部展开'}
+            onPress={() => (allExpanded ? setAllCollapsed() : setAllExpanded())}
+          />
+        }
+      />
 
       {loading ? (
         <StateView variant="loading" description="正在读取任务链" />

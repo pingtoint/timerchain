@@ -19,6 +19,7 @@
 import { create } from 'zustand';
 
 import * as planRepository from '../db';
+import * as notificationService from '../notifications/notificationService';
 import {
   PHASE_SOUND,
   type Plan,
@@ -35,6 +36,7 @@ export const INITIAL_RUN_STATE: RunState = {
   planId: null,
   status: 'idle',
   currentIndex: 0,
+  repeatIndex: 0,
   remainingSec: 0,
   phase: 'step',
 };
@@ -53,12 +55,15 @@ const MAX_PHASE_STEPS = 512;
 type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 
 interface PhaseTransition {
-  kind: 'step' | 'rest' | 'finished';
+  kind: 'step' | 'rest' | 'repeatRest' | 'finished';
   index: number;
+  /** 切换后处于第几遍（0 起），供播报"第 2/8 遍"。 */
+  repeat: number;
 }
 
 interface AdvanceResult {
   index: number;
+  repeatIndex: number;
   phase: RunPhase;
   /** 新的阶段结束时间戳；已完成时为 Number.POSITIVE_INFINITY。 */
   deadline: number;
@@ -83,6 +88,7 @@ function stepAt(plan: Plan, index: number) {
 function advance(
   plan: Plan,
   index: number,
+  repeatIndex: number,
   phase: RunPhase,
   deadline: number,
   now: number,
@@ -91,8 +97,16 @@ function advance(
   const transitions: PhaseTransition[] = [];
 
   let cursorIndex = index;
+  let cursorRepeat = repeatIndex;
   let cursorPhase = phase;
   let cursorDeadline = deadline;
+
+  // 计次阶段没有自然 deadline（INFINITY），从它往后推进时以 now 为锚点累积
+  const anchor = (d: number) => (d === Number.POSITIVE_INFINITY ? now : d);
+  const stepPhaseDeadline = (base: number, step: Plan['steps'][number] | undefined) =>
+    step?.kind === 'count'
+      ? Number.POSITIVE_INFINITY
+      : anchor(base) + (step?.durationSec ?? 0) * 1000;
 
   let guard = 0;
   while (now >= cursorDeadline) {
@@ -103,19 +117,45 @@ function advance(
 
     const current = stepAt(plan, cursorIndex);
 
-    // 步骤阶段结束：若该步声明了停歇，先进入 rest
-    if (cursorPhase === 'step' && current !== undefined && current.restAfterSec > 0) {
-      cursorPhase = 'rest';
-      cursorDeadline += current.restAfterSec * 1000;
-      transitions.push({ kind: 'rest', index: cursorIndex });
+    if (cursorPhase === 'step' && current !== undefined) {
+      // 一遍结束：还有下一遍 → 间隙（>0 秒时）或直接开下一遍
+      if (cursorRepeat < current.repeatCount - 1) {
+        if (current.repeatRestSec > 0) {
+          cursorPhase = 'repeatRest';
+          cursorDeadline = anchor(cursorDeadline) + current.repeatRestSec * 1000;
+          transitions.push({ kind: 'repeatRest', index: cursorIndex, repeat: cursorRepeat });
+          continue;
+        }
+        cursorRepeat += 1;
+        cursorDeadline = stepPhaseDeadline(cursorDeadline, current);
+        transitions.push({ kind: 'step', index: cursorIndex, repeat: cursorRepeat });
+        continue;
+      }
+
+      // 全部遍数完成：有停歇先进入 rest
+      if (current.restAfterSec > 0) {
+        cursorPhase = 'rest';
+        cursorDeadline = anchor(cursorDeadline) + current.restAfterSec * 1000;
+        transitions.push({ kind: 'rest', index: cursorIndex, repeat: cursorRepeat });
+        continue;
+      }
+    }
+
+    // 间隙结束 → 同一步的下一遍
+    if (cursorPhase === 'repeatRest' && current !== undefined) {
+      cursorRepeat += 1;
+      cursorPhase = 'step';
+      cursorDeadline = stepPhaseDeadline(cursorDeadline, current);
+      transitions.push({ kind: 'step', index: cursorIndex, repeat: cursorRepeat });
       continue;
     }
 
-    // 走到这里有两种情况：步骤没有停歇，或停歇已经结束 → 进入下一步
+    // 走到这里：停歇已结束（或本步无停歇）→ 进入下一步或全部完成
     if (cursorIndex >= lastIndex) {
-      transitions.push({ kind: 'finished', index: cursorIndex });
+      transitions.push({ kind: 'finished', index: cursorIndex, repeat: cursorRepeat });
       return {
         index: lastIndex,
+        repeatIndex: 0,
         phase: 'step',
         deadline: Number.POSITIVE_INFINITY,
         finished: true,
@@ -124,13 +164,20 @@ function advance(
     }
 
     cursorIndex += 1;
+    cursorRepeat = 0;
     cursorPhase = 'step';
-    const next = stepAt(plan, cursorIndex);
-    cursorDeadline += (next?.durationSec ?? 0) * 1000;
-    transitions.push({ kind: 'step', index: cursorIndex });
+    cursorDeadline = stepPhaseDeadline(cursorDeadline, stepAt(plan, cursorIndex));
+    transitions.push({ kind: 'step', index: cursorIndex, repeat: 0 });
   }
 
-  return { index: cursorIndex, phase: cursorPhase, deadline: cursorDeadline, finished: false, transitions };
+  return {
+    index: cursorIndex,
+    repeatIndex: cursorRepeat,
+    phase: cursorPhase,
+    deadline: cursorDeadline,
+    finished: false,
+    transitions,
+  };
 }
 
 function stepAlert(plan: Plan, index: number, skippedPhases: number): RunAlert {
@@ -191,6 +238,19 @@ function alertFromTransitions(plan: Plan, transitions: PhaseTransition[]): RunAl
       return stepAlert(plan, landed.index, skippedPhases);
     case 'rest':
       return restAlert(plan, landed.index, skippedPhases);
+    case 'repeatRest': {
+      // 间隙 = 同一部的两遍之间：预告"即将开始第 N 遍"
+      const step = stepAt(plan, landed.index);
+      alertSeq += 1;
+      return {
+        seq: alertSeq,
+        kind: 'repeatRest',
+        stepTitle: step?.title ?? null,
+        stepContent: `即将开始第 ${landed.repeat + 2} 遍`,
+        sound: step?.alertSound ?? PHASE_SOUND.repeatRest,
+        skippedPhases,
+      };
+    }
     case 'finished':
       return finishedAlert(skippedPhases);
   }
@@ -207,9 +267,11 @@ interface PlanStore {
 
   // ── 执行运行时 ────────────────────────────────────────
   run: RunState;
-  /** 当前阶段结束时刻（epoch ms）。null = 未在计时（idle / paused / finished）。 */
+  /** 当前阶段结束时刻（epoch ms）。null = 未在计时（idle / paused / finished / 计次阶段）。 */
   runDeadline: number | null;
-  /** 暂停瞬间锁定的剩余毫秒。用毫秒而不是秒，避免反复暂停累积秒级误差。 */
+  /** 计次阶段（count 步骤的 step phase）的开始时刻，用于正数计时；其它情况为 null。 */
+  phaseStartedAt: number | null;
+  /** 暂停瞬间锁定的毫秒数：计时阶段是"剩余"，计次阶段是"已进行"，避免反复暂停累积秒级误差。 */
   pausedRemainingMs: number | null;
   /** 最近一次阶段切换提醒。音频 / 震动 / 横幅共用它作为触发源。 */
   alert: RunAlert | null;
@@ -219,12 +281,18 @@ interface PlanStore {
   loadPlanById: (id: string) => Promise<Plan | null>;
   savePlan: (input: SavePlanInput) => Promise<Plan>;
   deletePlan: (id: string) => Promise<void>;
+  /** 批量删除（多选删除 / 清空全部共用）。包含正在执行的链时先终止。 */
+  deletePlans: (ids: string[]) => Promise<void>;
+  /** 列表页拖拽排序后批量写入新顺序（已按新位置排列的完整 ids 数组）。 */
+  reorderPlans: (orderedIds: string[]) => Promise<void>;
 
   startRun: (plan: Plan) => void;
   pauseRun: () => void;
   resumeRun: () => void;
   stopRun: () => void;
   clearRun: () => void;
+  /** 计次步骤手动完成当前遍：推进到间隙 / 下一遍 / 停歇 / 下一步 / 完成。 */
+  completeRep: () => void;
   /** 定时心跳。 */
   tick: () => void;
   /** 从后台回到前台时按时间戳对账。 */
@@ -239,7 +307,25 @@ export const usePlanStore = create<PlanStore>()((set, get) => {
    */
   function sync(now: number): void {
     const state = get();
-    if (state.run.status !== 'running' || state.runDeadline === null || state.activePlan === null) {
+    if (state.run.status !== 'running' || state.activePlan === null) {
+      return;
+    }
+
+    const plan = state.activePlan;
+
+    // 计次阶段：没有 deadline，心跳只做正数计时，推进交给 completeRep()
+    if (state.run.phase === 'step' && stepAt(plan, state.run.currentIndex)?.kind === 'count') {
+      if (state.phaseStartedAt === null) {
+        return;
+      }
+      const elapsedSec = Math.max(0, Math.floor((now - state.phaseStartedAt) / 1000));
+      if (elapsedSec !== state.run.remainingSec) {
+        set({ run: { ...state.run, remainingSec: elapsedSec } });
+      }
+      return;
+    }
+
+    if (state.runDeadline === null) {
       return;
     }
 
@@ -252,23 +338,41 @@ export const usePlanStore = create<PlanStore>()((set, get) => {
       return;
     }
 
-    const plan = state.activePlan;
-    const result = advance(plan, state.run.currentIndex, state.run.phase, state.runDeadline, now);
-    const remainingSec = result.finished
-      ? 0
-      : Math.max(0, Math.ceil((result.deadline - now) / 1000));
+    const result = advance(
+      plan,
+      state.run.currentIndex,
+      state.run.repeatIndex,
+      state.run.phase,
+      state.runDeadline,
+      now,
+    );
+    applyAdvance(plan, result, now, state.alert);
+  }
+
+  /** advance 的落点统一写库：同步心跳追帧与手动完成本遍共用。 */
+  function applyAdvance(
+    plan: Plan,
+    result: AdvanceResult,
+    now: number,
+    currentAlert: RunAlert | null,
+  ): void {
+    const untimed = !result.finished && result.deadline === Number.POSITIVE_INFINITY;
+    const remainingSec =
+      result.finished || untimed ? 0 : Math.max(0, Math.ceil((result.deadline - now) / 1000));
 
     set({
       run: {
         planId: plan.id,
         status: result.finished ? 'finished' : 'running',
         currentIndex: result.index,
+        repeatIndex: result.repeatIndex,
         remainingSec,
         phase: result.phase,
       },
-      runDeadline: result.finished ? null : result.deadline,
+      runDeadline: result.finished || untimed ? null : result.deadline,
+      phaseStartedAt: untimed ? now : null,
       pausedRemainingMs: null,
-      alert: alertFromTransitions(plan, result.transitions) ?? state.alert,
+      alert: alertFromTransitions(plan, result.transitions) ?? currentAlert,
     });
   }
 
@@ -279,6 +383,7 @@ export const usePlanStore = create<PlanStore>()((set, get) => {
     activePlan: null,
     run: INITIAL_RUN_STATE,
     runDeadline: null,
+    phaseStartedAt: null,
     pausedRemainingMs: null,
     alert: null,
 
@@ -305,6 +410,8 @@ export const usePlanStore = create<PlanStore>()((set, get) => {
       // 刻意不写 activePlan：保存动作可能发生在另一条任务链正在执行的时候，
       // 覆盖 activePlan 会把正在跑的计时器搞乱。
       await get().loadPlans();
+      // reminder 字段可能变了（enabled / 时间 / repeat 模式）——刷新系统通知
+      void notificationService.refreshAll();
       return saved;
     },
 
@@ -315,10 +422,46 @@ export const usePlanStore = create<PlanStore>()((set, get) => {
         get().stopRun();
       }
       await planRepository.deletePlan(id);
+      void notificationService.cancelOne(id);
       if (get().activePlan?.id === id) {
         set({ activePlan: null });
       }
       await get().loadPlans();
+    },
+
+    deletePlans: async (ids) => {
+      if (ids.length === 0) {
+        return;
+      }
+      const { run, activePlan } = get();
+      // 与 deletePlan 同一规格：正在执行的那条在删除前必须先终止
+      if (run.planId !== null && run.status !== 'idle' && ids.includes(run.planId)) {
+        get().stopRun();
+      }
+      await planRepository.deletePlans(ids);
+      for (const id of ids) {
+        void notificationService.cancelOne(id);
+      }
+      if (activePlan !== null && ids.includes(activePlan.id)) {
+        set({ activePlan: null });
+      }
+      await get().loadPlans();
+    },
+
+    reorderPlans: async (orderedIds) => {
+      await planRepository.reorderPlans(orderedIds);
+      // 乐观更新：立刻反映到 plans 数组，省一次 IO round-trip
+      const current = get().plans;
+      const byId = new Map(current.map((p) => [p.id, p]));
+      const reordered: PlanSummary[] = orderedIds
+        .map((id) => byId.get(id))
+        .filter((p): p is PlanSummary => p !== undefined);
+      if (reordered.length !== current.length) {
+        // ids 不匹配，放弃乐观更新，直接重新加载
+        await get().loadPlans();
+      } else {
+        set({ plans: reordered });
+      }
     },
 
     startRun: (plan) => {
@@ -328,16 +471,19 @@ export const usePlanStore = create<PlanStore>()((set, get) => {
         return;
       }
       const now = Date.now();
+      const untimed = first.kind === 'count';
       set({
         activePlan: plan,
         run: {
           planId: plan.id,
           status: 'running',
           currentIndex: 0,
-          remainingSec: first.durationSec,
+          repeatIndex: 0,
+          remainingSec: untimed ? 0 : first.durationSec,
           phase: 'step',
         },
-        runDeadline: now + first.durationSec * 1000,
+        runDeadline: untimed ? null : now + first.durationSec * 1000,
+        phaseStartedAt: untimed ? now : null,
         pausedRemainingMs: null,
         // 第一步也要提醒，否则用户点进去后听不到任何反馈
         alert: stepAlert(plan, 0, 0),
@@ -346,7 +492,30 @@ export const usePlanStore = create<PlanStore>()((set, get) => {
 
     pauseRun: () => {
       const state = get();
-      if (state.run.status !== 'running' || state.runDeadline === null) {
+      if (state.run.status !== 'running') {
+        return;
+      }
+      // 计次阶段：锁定"已进行"毫秒，恢复时从 phaseStartedAt 继续正数计时
+      if (state.runDeadline === null) {
+        const plan = state.activePlan;
+        if (
+          plan === null ||
+          state.run.phase !== 'step' ||
+          stepAt(plan, state.run.currentIndex)?.kind !== 'count' ||
+          state.phaseStartedAt === null
+        ) {
+          return;
+        }
+        const elapsedMs = Math.max(0, Date.now() - state.phaseStartedAt);
+        set({
+          run: {
+            ...state.run,
+            status: 'paused',
+            remainingSec: Math.floor(elapsedMs / 1000),
+          },
+          phaseStartedAt: null,
+          pausedRemainingMs: elapsedMs,
+        });
         return;
       }
       const remainingMs = Math.max(0, state.runDeadline - Date.now());
@@ -366,14 +535,21 @@ export const usePlanStore = create<PlanStore>()((set, get) => {
       if (state.run.status !== 'paused' || state.pausedRemainingMs === null) {
         return;
       }
-      const remainingMs = state.pausedRemainingMs;
+      const bankMs = state.pausedRemainingMs;
+      const plan = state.activePlan;
+      const untimed =
+        plan !== null &&
+        state.run.phase === 'step' &&
+        stepAt(plan, state.run.currentIndex)?.kind === 'count';
+      // 计次阶段恢复：bankMs 是"已进行"，重新锚定 phaseStartedAt
       set({
         run: {
           ...state.run,
           status: 'running',
-          remainingSec: Math.max(0, Math.ceil(remainingMs / 1000)),
+          remainingSec: Math.floor(bankMs / 1000),
         },
-        runDeadline: Date.now() + remainingMs,
+        runDeadline: untimed ? null : Date.now() + bankMs,
+        phaseStartedAt: untimed ? Date.now() - bankMs : null,
         pausedRemainingMs: null,
       });
     },
@@ -382,6 +558,7 @@ export const usePlanStore = create<PlanStore>()((set, get) => {
       set({
         run: INITIAL_RUN_STATE,
         runDeadline: null,
+        phaseStartedAt: null,
         pausedRemainingMs: null,
         alert: null,
       });
@@ -391,10 +568,28 @@ export const usePlanStore = create<PlanStore>()((set, get) => {
       set({
         run: INITIAL_RUN_STATE,
         runDeadline: null,
+        phaseStartedAt: null,
         pausedRemainingMs: null,
         alert: null,
         activePlan: null,
       });
+    },
+
+    completeRep: () => {
+      const state = get();
+      if (state.run.status !== 'running' || state.activePlan === null) {
+        return;
+      }
+      const plan = state.activePlan;
+      const current = stepAt(plan, state.run.currentIndex);
+      // 只有计次步骤的计次阶段允许手动完成；计时阶段走自然 deadline
+      if (state.run.phase !== 'step' || current?.kind !== 'count') {
+        return;
+      }
+      const now = Date.now();
+      // 把"现在"当作本遍的结束时刻喂给状态机，后续间隙/停歇从 now 起算
+      const result = advance(plan, state.run.currentIndex, state.run.repeatIndex, 'step', now, now);
+      applyAdvance(plan, result, now, state.alert);
     },
 
     tick: () => {

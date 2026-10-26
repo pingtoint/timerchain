@@ -11,6 +11,7 @@ import {
   type Plan,
   type SavePlanInput,
   type Step,
+  type StepKind,
 } from '../types';
 import { clamp } from './format';
 import { createId } from './id';
@@ -22,8 +23,11 @@ export function createEmptyStep(order: number): Step {
     order,
     title: '',
     content: '',
+    kind: 'timed', // 默认计时：大多数步骤是"做一段时间"
     durationSec: 5 * 60, // 默认 5 分钟：比 10 秒更接近"一段专注"的心理预期
-    restAfterSec: 60, // 默认停歇 1 分钟；最后一步会被归一化强制置 0
+    restAfterSec: 10, // 默认停歇 10 秒（间歇计时器惯例）；最后一步会被归一化强制置 0
+    repeatCount: 1, // 默认不重复
+    repeatRestSec: 0,
     alertSound: 'chime',
     videoUrl: null,
   };
@@ -34,33 +38,49 @@ export function createEmptyStep(order: number): Step {
  *
  * - 标题、内容去除首尾空格（规格 D）
  * - order 严格等于数组下标，杜绝拖拽后 order 错乱
- * - 时长夹取到合法区间（规格 D: 时长不能为 0）
+ * - timed：时长夹取到合法区间，次数/间隙强制 1/0（时长与次数二选一）
+ * - count：时长强制 0，次数夹取到 ≥1，仅遍数 >1 时保留间隙
  * - **最后一步的停歇强制为 0**（规格：最后一步不需要休息）
  */
 export function normalizePlanDraft(input: SavePlanInput): SavePlanInput {
   const lastIndex = input.steps.length - 1;
 
-  const steps = input.steps.map((step, index) => ({
-    ...step,
-    order: index,
-    title: step.title.trim(),
-    content: step.content.trim(),
-    durationSec: clamp(
-      Math.round(step.durationSec),
-      STEP_LIMITS.durationMinSec,
-      STEP_LIMITS.durationMaxSec,
-    ),
-    restAfterSec:
-      index === lastIndex
-        ? 0
-        : clamp(Math.round(step.restAfterSec), STEP_LIMITS.restMinSec, STEP_LIMITS.restMaxSec),
-    videoUrl: step.videoUrl ?? null,
-  }));
+  const steps = input.steps.map((step, index) => {
+    const kind: StepKind = step.kind === 'count' ? 'count' : 'timed';
+    const repeatCount = clamp(Math.round(step.repeatCount) || 1, 1, STEP_LIMITS.repeatMaxCount);
+    return {
+      ...step,
+      kind,
+      order: index,
+      title: step.title.trim(),
+      content: step.content.trim(),
+      durationSec:
+        kind === 'count'
+          ? 0
+          : clamp(
+              Math.round(step.durationSec),
+              STEP_LIMITS.durationMinSec,
+              STEP_LIMITS.durationMaxSec,
+            ),
+      restAfterSec:
+        index === lastIndex
+          ? 0
+          : clamp(Math.round(step.restAfterSec), STEP_LIMITS.restMinSec, STEP_LIMITS.restMaxSec),
+      repeatCount: kind === 'timed' ? 1 : repeatCount,
+      // 不重复的步骤间隙无意义，强制置 0，避免脏数据影响总时长统计
+      repeatRestSec:
+        kind === 'timed' || repeatCount === 1
+          ? 0
+          : clamp(Math.round(step.repeatRestSec) || 0, 0, STEP_LIMITS.repeatRestMaxSec),
+      videoUrl: step.videoUrl ?? null,
+    };
+  });
 
   return {
     id: input.id,
     title: input.title.trim(),
     steps,
+    reminder: input.reminder ?? null,
   };
 }
 
@@ -98,7 +118,8 @@ export function validatePlanDraft(input: SavePlanInput): PlanDraftValidation {
     if (step.title.length === 0) {
       fieldErrors.title = '步骤标题不能为空';
     }
-    if (step.durationSec <= 0) {
+    // 计次步骤没有时长概念，跳过时长校验
+    if (step.kind !== 'count' && step.durationSec <= 0) {
       fieldErrors.durationSec = '时长不能为 0';
     }
     if (fieldErrors.title !== undefined || fieldErrors.durationSec !== undefined) {
@@ -116,5 +137,12 @@ export function validatePlanDraft(input: SavePlanInput): PlanDraftValidation {
 
 /** 任务链总时长（含停歇），列表页与执行页共用同一口径。 */
 export function planTotalDurationSec(plan: Pick<Plan, 'steps'>): number {
-  return plan.steps.reduce((sum, step) => sum + step.durationSec + step.restAfterSec, 0);
+  return plan.steps.reduce(
+    (sum, step) =>
+      sum +
+      step.durationSec * step.repeatCount +
+      step.repeatRestSec * (step.repeatCount - 1) +
+      step.restAfterSec,
+    0,
+  );
 }

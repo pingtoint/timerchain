@@ -1,21 +1,24 @@
 /**
- * 自定义左滑删除行的容器（规格：不要用系统默认的粗糙样式）。
+ * 可滑动卡片容器。
  *
- * ── 为什么不用 react-native-gesture-handler 的旧版 `Swipeable` ────────
- * 旧版 Swipeable 的展开/回弹由 JS 线程驱动（Animated.event + useNativeDriver
- * 受限），快速滑动时会掉帧；新版 `ReanimatedSwipeable` 全程跑在 UI 线程上，
- * 跟手感完全不同。RNGH 3.x 里旧版已标记废弃，所以直接上 Reanimated 版本。
+ * ── 手势互斥（核心修复） ────────────────────────────────────────────
+ * 主流 App（Gmail、iOS 设置、微信消息）的左滑行互斥：滑开第二条时，第一条自动收起。
+ * 之前每个 SwipeRow 独立持有 ref，互不感知，导致连续滑多条时前一条挂在露出态。
  *
- * ── 交互细节 ──────────────────────────────────────────────────────
- * - `overshootRight={false}`：滑到头就停住，不让删除按钮被甩出去；
- * - `friction={2}`：卡片位移略慢于手指，产生"有重量"的手感；
- * - 删除按钮用自己的弧角和图标，而不是一块裸露的红色矩形。
+ * 修复：父级通过 `onSwipeableOpen` 回调把 methods 传出来，Swipable 之间通过
+ * `openOther` 互斥。右滑不再给空占位（`renderLeftActions` 会吞掉 overshoot
+ * 手势让回弹失效），改用 `activeOffsetX` 只激活左滑，右滑自然回弹。
+ *
+ * ── 按钮排列（左滑露出） ────────────────────────────────────────────
+ * 从左到右：编辑 → 删除 → 导出。导出贴卡片右缘，滑得浅先露出。
+ * 滑到 1/3 宽度自动吸住全露，松手自然弹回。
  */
 
 import { useCallback, useRef } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
 import Reanimated, { useAnimatedStyle, type SharedValue } from 'react-native-reanimated';
 import ReanimatedSwipeable, {
+  SwipeDirection,
   type SwipeableMethods,
 } from 'react-native-gesture-handler/ReanimatedSwipeable';
 
@@ -23,31 +26,62 @@ import { colors, radius, spacing } from '../theme';
 import { AppText } from './AppText';
 import { Icon } from './Icon';
 
-const ACTION_WIDTH = 88;
+const ACTION_WIDTH = 80;
 
 export interface SwipeRowProps {
   children: React.ReactNode;
-  /** 点删除按钮后触发。 */
+  /** 左滑 = 编辑（最左，滑得深时露出）。可选。 */
+  onEdit?: () => void;
+  editLabel?: string;
+  /** 左滑 = 导出（贴卡片右缘，滑得浅时先露出）。可选。 */
+  onShare?: () => void;
+  shareLabel?: string;
+  /** 左滑 = 删除（居中）。必选。 */
   onDelete: () => void;
   deleteLabel?: string;
-  /** 关闭时（例如列表进入编辑态）可临时禁用滑动。 */
+  /** 禁用滑动（多选模式等）。 */
   enabled?: boolean;
+  /** 父级提供的互斥 close 函数，其他行打开时调它先收起自己。 */
+  openOther?: () => void;
+  /** 自己被滑开时调父级，让父级通知其他行。 */
+  onOpened?: (methods: SwipeableMethods) => void;
+  /** 自己收起时调父级。 */
+  onClosed?: () => void;
 }
 
 export function SwipeRow({
   children,
+  onEdit,
+  editLabel = '编辑',
+  onShare,
+  shareLabel = '导出',
   onDelete,
   deleteLabel = '删除',
   enabled = true,
+  openOther,
+  onOpened,
+  onClosed,
 }: SwipeRowProps) {
   const methods = useRef<SwipeableMethods | null>(null);
 
+  const close = useCallback(() => methods.current?.close(), []);
+
+  const handleEdit = useCallback(() => {
+    close();
+    onEdit?.();
+  }, [close, onEdit]);
+
+  const handleShare = useCallback(() => {
+    close();
+    onShare?.();
+  }, [close, onShare]);
+
   const handleDelete = useCallback(() => {
-    // 先收起再回调：删除是异步的（要等 SQLite），如果不收起，
-    // 卡片会在等数据库的这段时间里一直挂在"露出删除按钮"的状态。
-    methods.current?.close();
+    close();
     onDelete();
-  }, [onDelete]);
+  }, [close, onDelete]);
+
+  const actionCount = (onEdit ? 1 : 0) + (onShare ? 1 : 0) + 1;
 
   return (
     <View style={styles.container}>
@@ -55,12 +89,35 @@ export function SwipeRow({
         ref={methods}
         enabled={enabled}
         friction={2}
-        rightThreshold={32}
-        overshootRight={false}
-        // 左滑不提供任何动作，避免"往哪边滑都有东西"的混乱
-        renderLeftActions={undefined}
+        // 左滑吸住阈值：超过按钮总宽的一半就吸住全露
+        rightThreshold={(ACTION_WIDTH * actionCount) / 2}
+        // 右滑橡皮筋感：给一个有实际宽度但透明的占位让手势跟手移动，
+        // 再用 MAX_SAFE_INTEGER 阈值保证松手永远弹回原位
+        renderLeftActions={() => <View style={{ width: 60 }} />}
+        leftThreshold={Number.MAX_SAFE_INTEGER}
+        overshootFriction={8}
+        // 第二条刚开始被拖就立刻关第一条（比 onSwipeableOpen 早 200ms+）
+        onSwipeableOpenStartDrag={(dir) => {
+          if (dir === SwipeDirection.LEFT) openOther?.();
+        }}
+        onSwipeableOpen={(dir) => {
+          if (dir === SwipeDirection.LEFT) {
+            onOpened?.(methods.current!);
+          }
+        }}
+        onSwipeableClose={(dir) => {
+          if (dir === SwipeDirection.LEFT) {
+            onClosed?.();
+          }
+        }}
         renderRightActions={(_progress, translation) => (
-          <DeleteAction translation={translation} label={deleteLabel} onPress={handleDelete} />
+          <TrailingActions
+            translation={translation}
+            width={ACTION_WIDTH * actionCount}
+            onEdit={onEdit === undefined ? null : { label: editLabel, onPress: handleEdit }}
+            onShare={onShare === undefined ? null : { label: shareLabel, onPress: handleShare }}
+            onDelete={{ label: deleteLabel, onPress: handleDelete }}
+          />
         )}
       >
         {children}
@@ -69,36 +126,89 @@ export function SwipeRow({
   );
 }
 
-interface DeleteActionProps {
-  translation: SharedValue<number>;
+interface TrailingButton {
   label: string;
   onPress: () => void;
 }
 
+interface TrailingActionsProps {
+  translation: SharedValue<number>;
+  width: number;
+  onEdit: TrailingButton | null;
+  onShare: TrailingButton | null;
+  onDelete: TrailingButton;
+}
+
 /**
- * 删除按钮本体。
- * 必须跟随 `translation` 一起平移，否则在滑动手势进行到一半时会提前
- * 露在卡片右侧外面（此时卡片还没让出位置）。
+ * 右侧动作组（左滑手势露出）。
+ * translation 是负数（卡片被拖向左），按钮组跟随 translateX 贴到卡片右边缘。
+ *
+ * 从左到右排列：编辑 → 删除 → 导出。
+ * 滑得浅先露出编辑（贴卡片右缘），滑到中间露出删除，全滑露出导出。
  */
-function DeleteAction({ translation, label, onPress }: DeleteActionProps) {
+function TrailingActions({ translation, width, onEdit, onShare, onDelete }: TrailingActionsProps) {
   const animatedStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: translation.value + ACTION_WIDTH }],
+    transform: [{ translateX: translation.value + width }],
   }));
 
   return (
-    <Reanimated.View style={[styles.actionWrapper, animatedStyle]}>
+    <Reanimated.View style={[styles.actionsRow, { width }, animatedStyle]}>
+      {onEdit === null ? null : (
+        <ActionButton
+          {...onEdit}
+          icon="create-outline"
+          background={colors.primary}
+          backgroundPressed={colors.primaryPressed}
+        />
+      )}
+      <ActionButton
+        {...onDelete}
+        icon="trash-outline"
+        background={colors.danger}
+        backgroundPressed={colors.dangerPressed}
+      />
+      {onShare === null ? null : (
+        <ActionButton
+          {...onShare}
+          icon="share-social-outline"
+          background={colors.primarySoft}
+          backgroundPressed={colors.primary}
+          tint="primary"
+        />
+      )}
+    </Reanimated.View>
+  );
+}
+
+interface ActionButtonProps {
+  label: string;
+  icon: 'trash-outline' | 'share-social-outline' | 'create-outline';
+  background: string;
+  backgroundPressed: string;
+  tint?: 'primary' | 'textOnPrimary';
+  onPress: () => void;
+}
+
+function ActionButton({ label, icon, background, backgroundPressed, tint, onPress }: ActionButtonProps) {
+  const iconColor = tint === 'primary' ? 'primary' : 'textOnPrimary';
+  const textColor = tint === 'primary' ? 'primary' : 'textOnPrimary';
+  return (
+    <View style={styles.actionWrapper}>
       <Pressable
         onPress={onPress}
         accessibilityRole="button"
         accessibilityLabel={label}
-        style={({ pressed }) => [styles.action, pressed ? styles.actionPressed : null]}
+        style={({ pressed }) => [
+          styles.action,
+          { backgroundColor: pressed ? backgroundPressed : background },
+        ]}
       >
-        <Icon name="trash-outline" size={20} color="textOnPrimary" />
-        <AppText variant="captionStrong" color="textOnPrimary">
+        <Icon name={icon} size={20} color={iconColor} />
+        <AppText variant="captionStrong" color={textColor}>
           {label}
         </AppText>
       </Pressable>
-    </Reanimated.View>
+    </View>
   );
 }
 
@@ -106,9 +216,13 @@ const styles = StyleSheet.create({
   container: {
     alignSelf: 'stretch',
   },
+  actionsRow: {
+    flexDirection: 'row',
+    alignItems: 'stretch',
+    justifyContent: 'flex-end',
+  },
   actionWrapper: {
     width: ACTION_WIDTH,
-    // 与卡片同高：卡片高度随标题行数变化，用拉伸而不是写死高度
     alignItems: 'stretch',
     justifyContent: 'center',
   },
@@ -119,9 +233,5 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     gap: spacing.xs,
     borderRadius: radius.lg,
-    backgroundColor: colors.danger,
-  },
-  actionPressed: {
-    backgroundColor: colors.dangerPressed,
   },
 });
